@@ -1,0 +1,42 @@
+name: Sync Codex stable release to R2
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily at 03:17 UTC. The odd minute avoids the top-of-hour GitHub Actions rush.
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-codex-stable
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ilovetoken-downloads
+      PUBLIC_BASE: https://download.ilovetoken.online
+      GITHUB_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check boto3
+
+      - name: Mirror latest stable Codex release
+        run: python scripts/sync_codex.py
