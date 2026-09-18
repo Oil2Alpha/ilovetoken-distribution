@@ -151,6 +151,35 @@ function Test-ILTModels {
     finally { if ($response) { $response.Dispose() }; $request.Dispose(); $client.Dispose(); $handler.Dispose(); $Key = $null }
 }
 
+function Normalize-ILTApiKey {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { throw 'No key was received.' }
+    $normalized = $Value.Trim()
+    if ([string]::IsNullOrWhiteSpace($normalized)) { throw 'No key was received. Paste or type the key, then press Enter.' }
+    if ($normalized.Length -gt 8192) { throw 'The key is unexpectedly long. Copy only the API key value.' }
+    if ($normalized -match '\s') { throw 'The key contains whitespace. Copy only the API key value, without a variable name or quotes.' }
+    return $normalized
+}
+
+function Read-ILTApiKey {
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $secureInput = $null; $ptr = [IntPtr]::Zero; $candidate = $null
+        try {
+            $secureInput = Read-Host 'I Love Token API key' -AsSecureString
+            $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureInput)
+            $candidate = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+            return Normalize-ILTApiKey $candidate
+        } catch {
+            if ($attempt -ge 3) { throw 'No valid API key was entered after 3 attempts. Setup stopped without changing the key or configuration.' }
+            Write-Warning ($_.Exception.Message + ' Try again; input remains hidden.')
+        } finally {
+            if ($ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+            if ($secureInput) { $secureInput.Dispose() }
+            $candidate = $null
+        }
+    }
+}
+
 function Invoke-ILTSetup {
     $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
     if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem) { throw '64-bit Windows is required.' }
@@ -159,7 +188,7 @@ function Invoke-ILTSetup {
     $configDir = [IO.Path]::GetFullPath($configDir)
     $configPath = Join-Path $configDir 'config.toml'
     [void][IO.Directory]::CreateDirectory($configDir)
-    $lock = $null; $tempFile = $null; $stage = $null; $secure = $null; $key = $null
+    $lock = $null; $tempFile = $null; $stage = $null; $key = $null
     $oldTls = [Net.ServicePointManager]::SecurityProtocol
     try {
         try { $lock = [IO.File]::Open((Join-Path $configDir '.ilovetoken-setup.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
@@ -218,11 +247,8 @@ function Invoke-ILTSetup {
         } finally { $p.Dispose() }
         Write-Host 'Enter your I Love Token API key locally. Input is hidden.'
         Write-Host 'It is stored in your Windows user environment and sent only to api.ilovetoken.online for the models check.'
-        $secure = Read-Host 'I Love Token API key' -AsSecureString
-        $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-        try { $key = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
-        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
-        if ([string]::IsNullOrWhiteSpace($key) -or $key -match '\s' -or $key.Length -gt 8192) { throw 'Key must be nonempty, without whitespace, and at most 8192 characters.' }
+        Write-Host 'Leading/trailing whitespace from the clipboard is removed automatically. You have up to 3 attempts.'
+        $key = Read-ILTApiKey
         # Recheck before commit in case an editor changed the config during install.
         [byte[]]$current = @()
         if ([IO.File]::Exists($configPath)) { $current = [IO.File]::ReadAllBytes($configPath) }
@@ -259,7 +285,7 @@ function Invoke-ILTSetup {
         Write-Host '  cd C:\path\to\your-project'
         Write-Host '  codex'
     } finally {
-        $key = $null; if ($secure) { $secure.Dispose() }
+        $key = $null
         [Net.ServicePointManager]::SecurityProtocol = $oldTls
         if ($tempFile -and [IO.File]::Exists($tempFile)) { [IO.File]::Delete($tempFile) }
         if ($stage -and [IO.Directory]::Exists($stage)) {
