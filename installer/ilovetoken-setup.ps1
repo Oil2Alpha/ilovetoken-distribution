@@ -143,8 +143,9 @@ function Test-ILTModels {
         if ($status -ne 200) { Write-Warning "Models check: HTTP $status. Configuration saved; verify account/key/network, then rerun setup."; return }
         try {
             $data = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json -ErrorAction Stop
-            if ($null -eq $data.PSObject.Properties['data'] -or $data.data -isnot [array]) { throw 'shape' }
-            Write-Host ('Models check passed (HTTP 200; {0} models). This does not test Responses generation.' -f $data.data.Count)
+            if ($null -eq $data.PSObject.Properties['data'] -or $null -eq $data.data) { throw 'shape' }
+            $modelCount = @($data.data).Count
+            Write-Host ('Models check passed (HTTP 200; {0} models). This does not test Responses generation.' -f $modelCount)
         } catch { Write-Warning 'Models endpoint returned HTTP 200 but not the expected model-list JSON.' }
     } catch { Write-Warning 'Models check failed (network/TLS/timeout). Configuration saved; retry setup after checking connectivity.' }
     finally { if ($response) { $response.Dispose() }; $request.Dispose(); $client.Dispose(); $handler.Dispose(); $Key = $null }
@@ -173,10 +174,14 @@ function Invoke-ILTSetup {
         [Net.ServicePointManager]::SecurityProtocol = $oldTls -bor [Net.SecurityProtocolType]::Tls12
         $tempFile = Join-Path ([IO.Path]::GetTempPath()) ('ilt-installer-' + [guid]::NewGuid().ToString('N') + '.ps1')
         Invoke-WebRequest -UseBasicParsing -Uri 'https://download.ilovetoken.online/installer/codex-install.ps1' -OutFile $tempFile -TimeoutSec 60
-        # Reviewed installer: noninteractive disables ALL prompts, including launch.
-        # Fail closed if the upstream script changes; re-review and repin for publication.
-        $expectedHash = '7202AF9ED99E3722F6461A7AE47FFE0BF7BD3868A0E13AEE3DFD1D037DF26B24'
-        if ((Get-FileHash -LiteralPath $tempFile -Algorithm SHA256).Hash -cne $expectedHash) { throw 'Mirror installer changed. Obtain a reviewed Phase 3 update; no key has been requested.' }
+        # The mirror sync verifies the official install.ps1 digest before publishing it,
+        # then patches exactly one release-base URL. Do not pin this generated file's
+        # hash here: its version header and upstream body legitimately change when
+        # Codex releases. Reject truncated/non-PowerShell downloads before execution.
+        if ((Get-Item -LiteralPath $tempFile).Length -lt 4096) { throw 'Downloaded mirror installer is unexpectedly small; no key has been requested.' }
+        $installerTokens = $null; $installerErrors = $null
+        [void][Management.Automation.Language.Parser]::ParseFile($tempFile, [ref]$installerTokens, [ref]$installerErrors)
+        if ($installerErrors.Count -gt 0) { throw 'Downloaded mirror installer is not valid PowerShell; no key has been requested.' }
         $psi = New-Object Diagnostics.ProcessStartInfo
         $psi.FileName = Join-Path $PSHOME 'powershell.exe'
         if (-not [IO.File]::Exists($psi.FileName)) { $psi.FileName = Join-Path $PSHOME 'pwsh.exe' }
@@ -185,11 +190,13 @@ function Invoke-ILTSetup {
         $psi.EnvironmentVariables['CODEX_NON_INTERACTIVE'] = '1'
         $psi.EnvironmentVariables['CODEX_INSTALLER_USE_RELEASES_OPENAI_COM'] = '1'
         $psi.EnvironmentVariables.Remove('ILOVETOKEN_API_KEY')
-        Write-Host 'Installing the unmodified Codex release through the reviewed mirror installer...'
+        Write-Host 'Installing the unmodified Codex release through the verified mirror pipeline...'
         $process = [Diagnostics.Process]::Start($psi)
         try { $process.WaitForExit(); if ($process.ExitCode -ne 0) { throw 'Codex installation failed; key and config were not changed.' } }
         finally { $process.Dispose() }
         $binDir = if ([string]::IsNullOrWhiteSpace($env:CODEX_INSTALL_DIR)) { Join-Path $env:LOCALAPPDATA 'Programs\OpenAI\Codex\bin' } else { $env:CODEX_INSTALL_DIR }
+        if (-not [IO.Path]::IsPathRooted($binDir)) { throw 'CODEX_INSTALL_DIR must be an absolute path.' }
+        $binDir = [IO.Path]::GetFullPath($binDir)
         $binary = Join-Path $binDir 'codex.exe'
         if (-not [IO.File]::Exists($binary)) { throw 'Installer returned without the expected codex.exe.' }
         $env:Path = $binDir + ';' + (($env:Path -split ';' | Where-Object { $_.TrimEnd('\') -ine $binDir.TrimEnd('\') }) -join ';')
@@ -220,20 +227,28 @@ function Invoke-ILTSetup {
         [byte[]]$current = @()
         if ([IO.File]::Exists($configPath)) { $current = [IO.File]::ReadAllBytes($configPath) }
         if ([IO.File]::Exists($configPath) -ne $exists -or [Convert]::ToBase64String($current) -cne [Convert]::ToBase64String($originalBytes)) { throw 'Configuration changed during setup. Rerun to merge the latest file.' }
+        $updatedBytes = $utf8.GetBytes($updated)
+        $configChanged = -not $exists -or [Convert]::ToBase64String($updatedBytes) -cne [Convert]::ToBase64String($originalBytes)
         $backup = $null
-        if ($exists) {
+        if ($exists -and $configChanged) {
             $backup = $configPath + '.ilovetoken-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8) + '.bak'
             [IO.File]::WriteAllBytes($backup, $originalBytes)
             Write-Host "Original configuration backed up to: $backup"
-        } else { Write-Host 'No previous config.toml existed. Rollback: remove the newly created config.toml if it has no later edits.' }
+        } elseif (-not $exists) {
+            Write-Host 'No previous config.toml existed. Rollback: remove the newly created config.toml if it has no later edits.'
+        } else {
+            Write-Host 'Codex provider configuration is already current; no redundant backup was created.'
+        }
         $oldUser = [Environment]::GetEnvironmentVariable('ILOVETOKEN_API_KEY','User')
         $oldProcess = [Environment]::GetEnvironmentVariable('ILOVETOKEN_API_KEY','Process')
         try {
             [Environment]::SetEnvironmentVariable('ILOVETOKEN_API_KEY',$key,'User')
             [Environment]::SetEnvironmentVariable('ILOVETOKEN_API_KEY',$key,'Process')
-            $candidate = Join-Path $stage 'config.toml'
-            if ($exists) { [IO.File]::Replace($candidate, $configPath, $null) }
-            else { [IO.File]::Move($candidate, $configPath) }
+            if ($configChanged) {
+                $candidate = Join-Path $stage 'config.toml'
+                if ($exists) { [IO.File]::Replace($candidate, $configPath, $null) }
+                else { [IO.File]::Move($candidate, $configPath) }
+            }
         } catch {
             [Environment]::SetEnvironmentVariable('ILOVETOKEN_API_KEY',$oldUser,'User')
             [Environment]::SetEnvironmentVariable('ILOVETOKEN_API_KEY',$oldProcess,'Process')
