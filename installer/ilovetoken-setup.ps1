@@ -267,19 +267,52 @@ function Invoke-ILTSetup {
         }
         $oldUser = [Environment]::GetEnvironmentVariable('ILOVETOKEN_API_KEY','User')
         $oldProcess = [Environment]::GetEnvironmentVariable('ILOVETOKEN_API_KEY','Process')
+        $saveStep = 'saving the Windows user environment variable'
         try {
             [Environment]::SetEnvironmentVariable('ILOVETOKEN_API_KEY',$key,'User')
+            $saveStep = 'saving the current PowerShell environment variable'
             [Environment]::SetEnvironmentVariable('ILOVETOKEN_API_KEY',$key,'Process')
             if ($configChanged) {
+                $saveStep = 'committing the Codex configuration'
                 $candidate = Join-Path $stage 'config.toml'
-                if ($exists) { [IO.File]::Replace($candidate, $configPath, $null) }
-                else { [IO.File]::Move($candidate, $configPath) }
+                if ($exists) {
+                    try {
+                        # Prefer an atomic NTFS replace. Some Windows setups/filesystems reject
+                        # File.Replace even though a normal overwrite is permitted.
+                        [IO.File]::Replace($candidate, $configPath, $null)
+                    } catch [System.IO.IOException] {
+                        Write-Warning 'Atomic config replacement was unavailable; using the verified backup + overwrite fallback.'
+                        [IO.File]::WriteAllBytes($configPath, $updatedBytes)
+                    } catch [System.PlatformNotSupportedException] {
+                        Write-Warning 'Atomic config replacement is not supported here; using the verified backup + overwrite fallback.'
+                        [IO.File]::WriteAllBytes($configPath, $updatedBytes)
+                    }
+                } else {
+                    [IO.File]::Move($candidate, $configPath)
+                }
+                $saveStep = 'verifying the saved Codex configuration'
+                [byte[]]$savedBytes = [IO.File]::ReadAllBytes($configPath)
+                if ([Convert]::ToBase64String($savedBytes) -cne [Convert]::ToBase64String($updatedBytes)) {
+                    throw 'The saved config.toml did not match the validated configuration.'
+                }
             }
         } catch {
-            [Environment]::SetEnvironmentVariable('ILOVETOKEN_API_KEY',$oldUser,'User')
-            [Environment]::SetEnvironmentVariable('ILOVETOKEN_API_KEY',$oldProcess,'Process')
-            throw 'Saving failed; prior environment restored. Keep the printed config backup for recovery.'
-        } finally { $oldUser = $null; $oldProcess = $null }
+            $saveError = $_.Exception
+            $restoreNotes = New-Object System.Collections.Generic.List[string]
+            try { [Environment]::SetEnvironmentVariable('ILOVETOKEN_API_KEY',$oldUser,'User') }
+            catch { [void]$restoreNotes.Add('user environment rollback failed') }
+            try { [Environment]::SetEnvironmentVariable('ILOVETOKEN_API_KEY',$oldProcess,'Process') }
+            catch { [void]$restoreNotes.Add('process environment rollback failed') }
+            if ($configChanged -and $exists -and $backup -and [IO.File]::Exists($backup)) {
+                try { [IO.File]::Copy($backup, $configPath, $true) }
+                catch { [void]$restoreNotes.Add('config rollback failed; use the printed .bak file manually') }
+            } elseif ($configChanged -and -not $exists -and [IO.File]::Exists($configPath)) {
+                try { [IO.File]::Delete($configPath) }
+                catch { [void]$restoreNotes.Add('new config cleanup failed') }
+            }
+            $suffix = if ($restoreNotes.Count -gt 0) { ' Rollback note: ' + ($restoreNotes -join '; ') + '.' } else { ' Prior environment/configuration restored.' }
+            throw ('Saving failed while {0}. {1}: {2}.{3} Keep the printed config backup for recovery.' -f $saveStep, $saveError.GetType().Name, $saveError.Message, $suffix)
+        } finally { $oldUser = $null; $oldProcess = $null; $saveError = $null }
         Test-ILTModels $key
         Write-Host 'Setup complete. Codex was not opened. In your own project directory, run:'
         Write-Host '  cd C:\path\to\your-project'
