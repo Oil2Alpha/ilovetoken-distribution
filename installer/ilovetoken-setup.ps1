@@ -276,17 +276,11 @@ function Invoke-ILTSetup {
                 $saveStep = 'committing the Codex configuration'
                 $candidate = Join-Path $stage 'config.toml'
                 if ($exists) {
-                    try {
-                        # Prefer an atomic NTFS replace. Some Windows setups/filesystems reject
-                        # File.Replace even though a normal overwrite is permitted.
-                        [IO.File]::Replace($candidate, $configPath, $null)
-                    } catch [System.IO.IOException] {
-                        Write-Warning 'Atomic config replacement was unavailable; using the verified backup + overwrite fallback.'
-                        [IO.File]::WriteAllBytes($configPath, $updatedBytes)
-                    } catch [System.PlatformNotSupportedException] {
-                        Write-Warning 'Atomic config replacement is not supported here; using the verified backup + overwrite fallback.'
-                        [IO.File]::WriteAllBytes($configPath, $updatedBytes)
-                    }
+                    # The original config has already been backed up above. Avoid File.Replace
+                    # here because Windows PowerShell 5.1/.NET Framework can reject a null
+                    # backup path with 'The given path's format is not supported'. Write the
+                    # already validated bytes directly, then verify them byte-for-byte below.
+                    [IO.File]::WriteAllBytes($configPath, $updatedBytes)
                 } else {
                     [IO.File]::Move($candidate, $configPath)
                 }
